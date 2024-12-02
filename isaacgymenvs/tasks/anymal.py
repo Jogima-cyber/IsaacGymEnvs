@@ -85,6 +85,7 @@ class Anymal(VecTask):
         self.named_default_joint_angles = self.cfg["env"]["defaultJointAngles"]
 
         self.cfg["env"]["numObservations"] = 48
+        self.num_dyn_obs = 48
         self.cfg["env"]["numActions"] = 12
 
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless, virtual_screen_capture=virtual_screen_capture, force_render=force_render)
@@ -223,6 +224,9 @@ class Anymal(VecTask):
 
         self.base_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.anymal_handles[0], "base")
 
+        self.dyn_obs_buf = torch.zeros(
+            (self.num_envs, self.num_dyn_obs), device=self.device, dtype=torch.float)
+
     def pre_physics_step(self, actions):
         self.actions = actions.clone().to(self.device)
         targets = self.action_scale * self.actions + self.default_dof_pos
@@ -237,6 +241,9 @@ class Anymal(VecTask):
 
         self.compute_observations()
         self.compute_reward(self.actions)
+        self.dyn_obs_buf = self.obs_buf.clone()
+        self.extras["obs_before_reset"] = self.dyn_obs_buf.clone()
+        self.extras["dones"] = self.reset_buf.clone()
 
     def compute_reward(self, actions):
         self.rew_buf[:], self.reset_buf[:] = compute_anymal_reward(
@@ -260,6 +267,7 @@ class Anymal(VecTask):
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_dof_force_tensor(self.sim)
 
+        
         self.obs_buf[:] = compute_anymal_observations(  # tensors
                                                         self.root_states,
                                                         self.commands,
@@ -302,6 +310,15 @@ class Anymal(VecTask):
 
         self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 1
+
+    def full2partial_state(self, full_obs):
+        return full_obs
+
+    def diffRecalculateReward(self, full_obs, actions):
+        diff_rew = compute_neuro_diff_sim_anymal_reward(
+            full_obs, self.commands, self.rew_scales, self.lin_vel_scale, self.ang_vel_scale
+        )
+        return diff_rew
 
 #####################################################################
 ###=========================jit functions=========================###
@@ -350,8 +367,32 @@ def compute_anymal_reward(
 
     return total_reward.detach(), reset
 
-
 @torch.jit.script
+def compute_neuro_diff_sim_anymal_reward(
+    full_obs, commands, rew_scales, lin_vel_scale, ang_vel_scale
+):
+    # (reward, reset, feet_in air, feet_air_time, episode sums)
+    # type: (Tensor, Tensor, Dict[str, float], float, float) -> Tensor
+
+    # prepare quantities (TODO: return from obs ?)
+    base_lin_vel = full_obs[..., :3] / lin_vel_scale
+    base_ang_vel = full_obs[..., 3:6] / ang_vel_scale
+
+    # velocity tracking reward
+    lin_vel_error = torch.sum(torch.square(commands[:, :2] - base_lin_vel[:, :2]), dim=1)
+    ang_vel_error = torch.square(commands[:, 2] - base_ang_vel[:, 2])
+    rew_lin_vel_xy = torch.exp(-lin_vel_error/0.25) * rew_scales["lin_vel_xy"]
+    rew_ang_vel_z = torch.exp(-ang_vel_error/0.25) * rew_scales["ang_vel_z"]
+
+    # torque penalty
+    #rew_torque = torch.sum(torch.square(torques), dim=1) * rew_scales["torque"]
+
+    total_reward = rew_lin_vel_xy + rew_ang_vel_z #+ rew_torque
+    total_reward = torch.clip(total_reward, 0., None)
+
+    return total_reward
+
+#@torch.jit.script
 def compute_anymal_observations(root_states,
                                 commands,
                                 dof_pos,

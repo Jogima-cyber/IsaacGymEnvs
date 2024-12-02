@@ -102,7 +102,8 @@ class FrankaCubeStack(VecTask):
 
         # dimensions
         # obs include: cubeA_pose (7) + cubeB_pos (3) + eef_pose (7) + q_gripper (2)
-        self.cfg["env"]["numObservations"] = 19 if self.control_type == "osc" else 26
+        self.cfg["env"]["numObservations"] = 19 + 6 if self.control_type == "osc" else 26
+        self.num_dyn_obs = 19 + 6
         # actions include: delta EEF if OSC (6) or joint torques (7) + bool gripper (1)
         self.cfg["env"]["numActions"] = 7 if self.control_type == "osc" else 8
 
@@ -355,6 +356,9 @@ class FrankaCubeStack(VecTask):
         # Setup data
         self.init_data()
 
+        self.dyn_obs_buf = torch.zeros(
+            (self.num_envs, self.num_dyn_obs), device=self.device, dtype=torch.float)
+
     def init_data(self):
         # Setup sim handles
         env_ptr = self.envs[0]
@@ -449,7 +453,7 @@ class FrankaCubeStack(VecTask):
 
     def compute_observations(self):
         self._refresh()
-        obs = ["cubeA_quat", "cubeA_pos", "cubeA_to_cubeB_pos", "eef_pos", "eef_quat"]
+        obs = ["cubeA_quat", "cubeA_pos", "cubeA_to_cubeB_pos", "eef_pos", "eef_quat", "eef_lf_pos", "eef_rf_pos"]
         obs += ["q_gripper"] if self.control_type == "osc" else ["q"]
         self.obs_buf = torch.cat([self.states[ob] for ob in obs], dim=-1)
 
@@ -663,6 +667,9 @@ class FrankaCubeStack(VecTask):
 
         self.compute_observations()
         self.compute_reward(self.actions)
+        self.dyn_obs_buf = self.obs_buf.clone()
+        self.extras["obs_before_reset"] = self.dyn_obs_buf.clone()
+        self.extras["dones"] = self.reset_buf.clone()
 
         # debug viz
         if self.viewer and self.debug_viz:
@@ -688,6 +695,13 @@ class FrankaCubeStack(VecTask):
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [0.85, 0.1, 0.1])
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0.1, 0.85, 0.1])
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0.1, 0.1, 0.85])
+
+    def full2partial_state(self, full_obs):
+        return full_obs
+
+    def diffRecalculateReward(self, full_obs, actions):
+        diff_rew = compute_neuro_diff_sim_franka_reward(full_obs, self.reset_buf, self.progress_buf, actions, self.states, self.reward_settings, self.max_episode_length)
+        return diff_rew
 
 #####################################################################
 ###=========================jit functions=========================###
@@ -745,3 +759,58 @@ def compute_franka_reward(
     reset_buf = torch.where((progress_buf >= max_episode_length - 1) | (stack_reward > 0), torch.ones_like(reset_buf), reset_buf)
 
     return rewards, reset_buf
+
+@torch.jit.script
+def compute_neuro_diff_sim_franka_reward(
+    full_obs, reset_buf, progress_buf, actions, states, reward_settings, max_episode_length
+):
+    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, float], float) -> Tensor
+
+    # Compute per-env physical parameters
+    target_height = states["cubeB_size"] + states["cubeA_size"] / 2.0
+    cubeA_size = states["cubeA_size"]
+    cubeB_size = states["cubeB_size"]
+
+    # distance from hand to the cubeA
+    cubeA_pos = full_obs[..., 4:7]
+    eef_pos = full_obs[..., 10:13]
+    cubeA_pos_relative = cubeA_pos - eef_pos
+    d = torch.norm(cubeA_pos_relative, dim=-1) # torch.norm(states["cubeA_pos_relative"], dim=-1)
+    eef_lf_pos = full_obs[..., 17:20]
+    d_lf = torch.norm(cubeA_pos - eef_lf_pos, dim=-1) #torch.norm(states["cubeA_pos"] - states["eef_lf_pos"], dim=-1)
+    eef_rf_pos = full_obs[..., 20:23]
+    d_rf = torch.norm(cubeA_pos - eef_rf_pos, dim=-1) # torch.norm(states["cubeA_pos"] - states["eef_rf_pos"], dim=-1)
+    dist_reward = 1 - torch.tanh(10.0 * (d + d_lf + d_rf) / 3)
+
+    # reward for lifting cubeA
+    cubeA_height = cubeA_pos[:, 2] - reward_settings["table_height"] # states["cubeA_pos"][:, 2] - reward_settings["table_height"]
+    cubeA_lifted = (cubeA_height - cubeA_size) > 0.04
+    lift_reward = cubeA_lifted
+
+    # how closely aligned cubeA is to cubeB (only provided if cubeA is lifted)
+    offset = torch.zeros_like(states["cubeA_to_cubeB_pos"])
+    offset[:, 2] = (cubeA_size + cubeB_size) / 2
+    d_ab = torch.norm(full_obs[..., 7:10] + offset, dim=-1) # torch.norm(states["cubeA_to_cubeB_pos"] + offset, dim=-1)
+    align_reward = (1 - torch.tanh(10.0 * d_ab)) * cubeA_lifted
+
+    # Dist reward is maximum of dist and align reward
+    dist_reward = torch.max(dist_reward, align_reward)
+
+    # final reward for stacking successfully (only if cubeA is close to target height and corresponding location, and gripper is not grasping)
+    cubeA_align_cubeB = (torch.norm(full_obs[..., 7:10][:, :2], dim=-1) < 0.02) # (torch.norm(states["cubeA_to_cubeB_pos"][:, :2], dim=-1) < 0.02)
+    cubeA_on_cubeB = torch.abs(cubeA_height - target_height) < 0.02
+    gripper_away_from_cubeA = (d > 0.04)
+    stack_reward = cubeA_align_cubeB & cubeA_on_cubeB & gripper_away_from_cubeA
+
+    # Compose rewards
+
+    # We either provide the stack reward or the align + dist reward
+    rewards = torch.where(
+        stack_reward,
+        reward_settings["r_stack_scale"] * stack_reward,
+        reward_settings["r_dist_scale"] * dist_reward + reward_settings["r_lift_scale"] * lift_reward + reward_settings[
+            "r_align_scale"] * align_reward,
+    )
+
+    return rewards
+

@@ -78,6 +78,7 @@ class BallBalance(VecTask):
         # 18:21 - sensor torque 2
         # 21:24 - sensor torque 3
         self.cfg["env"]["numObservations"] = 24
+        self.num_dyn_obs = 24
 
         # Actions: target velocities for the 3 actuated DOFs
         self.cfg["env"]["numActions"] = 3
@@ -334,6 +335,9 @@ class BallBalance(VecTask):
             self.envs.append(env_ptr)
             self.bbot_handles.append(bbot_handle)
 
+        self.dyn_obs_buf = torch.zeros(
+            (self.num_envs, self.num_dyn_obs), device=self.device, dtype=torch.float)
+
     def compute_observations(self):
         #print("~!~!~!~! Computing obs")
 
@@ -359,6 +363,19 @@ class BallBalance(VecTask):
             self.ball_radius,
             self.reset_buf, self.progress_buf, self.max_episode_length
         )
+
+    def full2partial_state(self, full_obs):
+        return full_obs
+
+    def diffRecalculateReward(self, full_obs, actions):
+        diff_rew, _ = compute_bbot_reward(
+            self.tray_positions,
+            full_obs[..., 6:9],
+            full_obs[..., 9:12],
+            self.ball_radius,
+            self.reset_buf, self.progress_buf, self.max_episode_length
+        )
+        return diff_rew
 
     def reset_idx(self, env_ids):
         num_resets = len(env_ids)
@@ -434,6 +451,9 @@ class BallBalance(VecTask):
 
         self.compute_observations()
         self.compute_reward()
+        self.dyn_obs_buf = self.obs_buf.clone()
+        self.extras["obs_before_reset"] = self.dyn_obs_buf.clone()
+        self.extras["dones"] = self.reset_buf.clone()
 
         # vis
         if self.viewer and self.debug_viz:

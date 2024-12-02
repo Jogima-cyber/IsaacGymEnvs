@@ -102,7 +102,7 @@ class ShadowHand(VecTask):
         # can be "openai", "full_no_vel", "full", "full_state"
         self.obs_type = self.cfg["env"]["observationType"]
 
-        if not (self.obs_type in ["openai", "full_no_vel", "full", "full_state"]):
+        if not (self.obs_type in ["openai", "full_no_vel", "full", "full_state", "neuro_diff_sim"]):
             raise Exception(
                 "Unknown type of observations!\nobservationType should be one of: [openai, full_no_vel, full, full_state]")
 
@@ -111,6 +111,7 @@ class ShadowHand(VecTask):
         self.num_obs_dict = {
             "openai": 42,
             "full_no_vel": 77,
+            "neuro_diff_sim": 110,
             "full": 157,
             "full_state": 211
         }
@@ -129,6 +130,7 @@ class ShadowHand(VecTask):
             num_states = 211
 
         self.cfg["env"]["numObservations"] = self.num_obs_dict[self.obs_type]
+        self.num_dyn_obs = self.num_obs_dict[self.obs_type]
         self.cfg["env"]["numStates"] = num_states
         self.cfg["env"]["numActions"] = 20
 
@@ -412,6 +414,9 @@ class ShadowHand(VecTask):
         self.object_indices = to_torch(self.object_indices, dtype=torch.long, device=self.device)
         self.goal_object_indices = to_torch(self.goal_object_indices, dtype=torch.long, device=self.device)
 
+        self.dyn_obs_buf = torch.zeros(
+            (self.num_envs, self.num_dyn_obs), device=self.device, dtype=torch.float)
+
     def compute_reward(self, actions):
         self.rew_buf[:], self.reset_buf[:], self.reset_goal_buf[:], self.progress_buf[:], self.successes[:], self.consecutive_successes[:] = compute_hand_reward(
             self.rew_buf, self.reset_buf, self.reset_goal_buf, self.progress_buf, self.successes, self.consecutive_successes,
@@ -420,6 +425,7 @@ class ShadowHand(VecTask):
             self.success_tolerance, self.reach_goal_bonus, self.fall_dist, self.fall_penalty,
             self.max_consecutive_successes, self.av_factor, (self.object_type == "pen")
         )
+        self.extras["dones"] = self.reset_buf.clone()
 
         self.extras['consecutive_successes'] = self.consecutive_successes.mean()
 
@@ -464,11 +470,16 @@ class ShadowHand(VecTask):
             self.compute_full_observations()
         elif self.obs_type == "full_state":
             self.compute_full_state()
+        elif self.obs_type == "neuro_diff_sim":
+            self.compute_neuro_diff_sim_observations()
         else:
             print("Unknown observations type!")
 
         if self.asymmetric_obs:
             self.compute_full_state(True)
+
+        self.dyn_obs_buf = self.obs_buf.clone()
+        self.extras["obs_before_reset"] = self.dyn_obs_buf.clone()
 
     def compute_fingertip_observations(self, no_vel=False):
         if no_vel:
@@ -484,6 +495,18 @@ class ShadowHand(VecTask):
 
             self.obs_buf[:, 22:42] = self.actions
         else:
+            # 13*self.num_fingertips = 65
+            self.obs_buf[:, 0:65] = self.fingertip_state.reshape(self.num_envs, 65)
+            self.obs_buf[:, 65:72] = self.object_pose
+            self.obs_buf[:, 72:75] = self.object_linvel
+            self.obs_buf[:, 75:78] = self.vel_obs_scale * self.object_angvel
+
+            self.obs_buf[:, 78:85] = self.goal_pose
+            self.obs_buf[:, 85:89] = quat_mul(self.object_rot, quat_conjugate(self.goal_rot))
+
+            self.obs_buf[:, 89:109] = self.actions
+
+    def compute_neuro_diff_sim_observations(self):
             # 13*self.num_fingertips = 65
             self.obs_buf[:, 0:65] = self.fingertip_state.reshape(self.num_envs, 65)
             self.obs_buf[:, 65:72] = self.object_pose
@@ -667,6 +690,25 @@ class ShadowHand(VecTask):
         self.reset_buf[env_ids] = 0
         self.successes[env_ids] = 0
 
+    def full2partial_state(self, full_obs):
+        return full_obs
+
+    def diffRecalculateReward(self, full_obs, actions):
+        object_pos = full_obs[:, 65:72][:, :3]
+        object_rot = full_obs[:, 65:72][:, 3:]
+        #obj_obs_start = 3*self.num_shadow_hand_dofs
+        #object_pos = full_obs[:, obj_obs_start:obj_obs_start + 7][:, :3]
+        #object_rot = full_obs[:, obj_obs_start:obj_obs_start + 7][:, 3:]
+
+        diff_rew, _, _, _, _, _ = compute_hand_reward(
+            self.rew_buf, self.reset_buf, self.reset_goal_buf, self.progress_buf, self.successes, self.consecutive_successes,
+            self.max_episode_length, object_pos, object_rot, self.goal_pos, self.goal_rot,
+            self.dist_reward_scale, self.rot_reward_scale, self.rot_eps, actions, self.action_penalty_scale,
+            self.success_tolerance, self.reach_goal_bonus, self.fall_dist, self.fall_penalty,
+            self.max_consecutive_successes, self.av_factor, (self.object_type == "pen")
+        )
+        return diff_rew
+
     def pre_physics_step(self, actions):
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         goal_env_ids = self.reset_goal_buf.nonzero(as_tuple=False).squeeze(-1)
@@ -743,7 +785,7 @@ class ShadowHand(VecTask):
 #####################################################################
 
 
-@torch.jit.script
+#@torch.jit.script
 def compute_hand_reward(
     rew_buf, reset_buf, reset_goal_buf, progress_buf, successes, consecutive_successes,
     max_episode_length: float, object_pos, object_rot, target_pos, target_rot,

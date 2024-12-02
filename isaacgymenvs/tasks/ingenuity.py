@@ -49,6 +49,7 @@ class Ingenuity(VecTask):
         # Observations:
         # 0:13 - root state
         self.cfg["env"]["numObservations"] = 13
+        self.num_dyn_obs = 13
 
         # Actions:
         # 0:3 - xyz force vector for lower rotor
@@ -282,6 +283,9 @@ class Ingenuity(VecTask):
                 self.rotor_env_offsets[i, ..., 1] = env_origin.y
                 self.rotor_env_offsets[i, ..., 2] = env_origin.z
 
+        self.dyn_obs_buf = torch.zeros(
+            (self.num_envs, self.num_dyn_obs), device=self.device, dtype=torch.float)
+
     def set_targets(self, env_ids):
         num_sets = len(env_ids)
         # set target position randomly with x, y in (-5, 5) and z in (1, 2)
@@ -367,6 +371,9 @@ class Ingenuity(VecTask):
 
         self.compute_observations()
         self.compute_reward()
+        self.dyn_obs_buf = self.obs_buf.clone()
+        self.extras["obs_before_reset"] = self.dyn_obs_buf.clone()
+        self.extras["dones"] = self.reset_buf.clone()
 
         # debug viz
         if self.viewer and self.debug_viz:
@@ -402,6 +409,14 @@ class Ingenuity(VecTask):
             self.reset_buf, self.progress_buf, self.max_episode_length
         )
 
+    def full2partial_state(self, full_obs):
+        return full_obs
+
+    def diffRecalculateReward(self, full_obs, actions):
+        diff_rew = compute_neuro_diff_sim_ingenuity_reward(
+            full_obs
+        )
+        return diff_rew
 
 #####################################################################
 ###=========================jit functions=========================###
@@ -438,3 +453,29 @@ def compute_ingenuity_reward(root_positions, target_root_positions, root_quats, 
     reset = torch.where(progress_buf >= max_episode_length - 1, ones, die)
 
     return reward, reset
+
+@torch.jit.script
+def compute_neuro_diff_sim_ingenuity_reward(full_obs):
+    # type: (Tensor) -> Tensor
+
+    # distance to target
+    target_dist = torch.sqrt(torch.square(full_obs[..., :3] * 3).sum(-1))
+    if (target_dist <= 0.05).any():
+        print("target reached for", (target_dist <= 0.05).sum().item())
+
+    pos_reward = 1.0 / (1.0 + target_dist * target_dist)
+
+    # uprightness
+    ups = quat_axis(full_obs[..., 3:7], 2)
+    tiltage = torch.abs(1 - ups[..., 2])
+    up_reward = 5.0 / (1.0 + tiltage * tiltage)
+
+    # spinning
+    spinnage = torch.abs(full_obs[..., 10:13][..., 2] * math.pi)
+    spinnage_reward = 1.0 / (1.0 + spinnage * spinnage)
+
+    # combined reward
+    # uprigness and spinning only matter when close to the target
+    reward = pos_reward + pos_reward * (up_reward + spinnage_reward)
+
+    return reward
